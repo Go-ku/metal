@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Bell, Home, ReceiptText, Wrench } from 'lucide-react';
+import { AlertTriangle, Bell, Home, MapPin, ReceiptText, Wrench } from 'lucide-react';
 import Button from '@/components/ui/button';
 import Badge from '@/components/ui/badge';
 import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -10,7 +10,15 @@ import Label from '@/components/ui/label';
 import Select from '@/components/ui/select';
 import Textarea from '@/components/ui/textarea';
 import SimpleTable from '@/components/dashboard/SimpleTable';
-import { maintenanceTickets as seedTickets, payments as seedPayments, properties, reminders as seedReminders, roles, tenants as seedTenants } from '@/lib/mockData';
+import {
+  maintenanceGuides,
+  maintenanceTickets as seedTickets,
+  payments as seedPayments,
+  properties,
+  reminders as seedReminders,
+  roles,
+  tenants as seedTenants,
+} from '@/lib/mockData';
 
 const currency = new Intl.NumberFormat('en-ZM', { style: 'currency', currency: 'ZMW' });
 
@@ -29,18 +37,50 @@ export default function HomePage() {
   const tenantLookup = useMemo(() => Object.fromEntries(tenants.map((t) => [t.id, t])), [tenants]);
   const propertyLookup = useMemo(() => Object.fromEntries(properties.map((p) => [p.id, p])), []);
 
+  const arrears = useMemo(() => {
+    const paymentLookup = payments.reduce((acc, payment) => {
+      if (!acc[payment.tenantId] || new Date(payment.date) > new Date(acc[payment.tenantId].date)) {
+        acc[payment.tenantId] = payment;
+      }
+      return acc;
+    }, {});
+
+    return tenants
+      .map((tenant) => {
+        const lastPayment = paymentLookup[tenant.id];
+        const outstanding = Math.max(tenant.rent - Number(lastPayment?.amount ?? 0), 0);
+        return {
+          ...tenant,
+          outstanding,
+          lastPayment: lastPayment?.date,
+        };
+      })
+      .filter((tenant) => tenant.outstanding > 0);
+  }, [payments, tenants]);
+
+  const renewals = useMemo(
+    () =>
+      tenants.filter((tenant) => {
+        const daysToEnd = (new Date(tenant.leaseEnd) - new Date()) / (1000 * 60 * 60 * 24);
+        return daysToEnd > 0 && daysToEnd < 150;
+      }),
+    [tenants]
+  );
+
   const summaries = useMemo(() => {
     const openTickets = tickets.filter((t) => t.status !== 'Closed').length;
     const pendingReceipts = payments.filter((p) => !p.receipt).length;
     const dueLeases = tenants.filter((t) => new Date(t.leaseEnd) < new Date('2025-02-01')).length;
+    const arrearsTotal = arrears.reduce((sum, tenant) => sum + tenant.outstanding, 0);
     return [
       { label: 'Active leases', value: tenants.length, icon: Home, color: 'text-brand-700' },
       { label: 'Rent posted', value: currency.format(payments.reduce((sum, p) => sum + Number(p.amount || 0), 0)), icon: ReceiptText, color: 'text-emerald-600' },
       { label: 'Receipts to issue', value: pendingReceipts, icon: Bell, color: 'text-amber-600' },
       { label: 'Open maintenance', value: openTickets, icon: Wrench, color: 'text-rose-600' },
       { label: 'Leases under review', value: dueLeases, icon: Home, color: 'text-indigo-600' },
+      { label: 'Arrears exposure', value: currency.format(arrearsTotal), icon: AlertTriangle, color: 'text-amber-700' },
     ];
-  }, [payments, tenants, tickets]);
+  }, [arrears, payments, tenants, tickets]);
 
   const paymentColumns = [
     { header: 'Tenant', cell: (info) => tenantLookup[info.row.original.tenantId]?.name },
@@ -72,9 +112,16 @@ export default function HomePage() {
     {
       header: 'Status',
       cell: (info) => (
-        <Badge intent={info.row.original.status === 'Open' ? 'warning' : info.row.original.status === 'Closed' ? 'neutral' : 'info'}>
-          {info.row.original.status}
-        </Badge>
+        <div className="flex items-center gap-2">
+          <Badge intent={info.row.original.status === 'Open' ? 'warning' : info.row.original.status === 'Closed' ? 'neutral' : 'info'}>
+            {info.row.original.status}
+          </Badge>
+          {info.row.original.status !== 'Closed' && (
+            <Button size="xs" variant="ghost" onClick={() => advanceTicket(info.row.original.id)} className="text-xs">
+              Advance
+            </Button>
+          )}
+        </div>
       ),
     },
   ];
@@ -87,7 +134,14 @@ export default function HomePage() {
     {
       header: 'Status',
       cell: (info) => (
-        <Badge intent={info.row.original.status === 'Sent' ? 'success' : 'info'}>{info.row.original.status}</Badge>
+        <div className="flex items-center gap-2">
+          <Badge intent={info.row.original.status === 'Sent' ? 'success' : 'info'}>{info.row.original.status}</Badge>
+          {info.row.original.status !== 'Sent' && (
+            <Button size="xs" variant="ghost" onClick={() => handleReminderSend(info.row.original.id)} className="text-xs">
+              Send now
+            </Button>
+          )}
+        </div>
       ),
     },
   ];
@@ -99,6 +153,62 @@ export default function HomePage() {
     { header: 'Rent', cell: (info) => currency.format(info.row.original.rent) },
     { header: 'Lease ends', cell: (info) => info.row.original.leaseEnd },
   ];
+
+  const arrearsColumns = [
+    { header: 'Tenant', cell: (info) => info.row.original.name },
+    { header: 'Property', cell: (info) => propertyLookup[info.row.original.propertyId]?.name },
+    { header: 'Outstanding', cell: (info) => currency.format(info.row.original.outstanding) },
+    { header: 'Last paid', cell: (info) => info.row.original.lastPayment || '—' },
+    {
+      header: 'Action',
+      cell: (info) => (
+        <Button size="xs" variant="outline" onClick={() => queueReminder(info.row.original.id)}>
+          Chase payment
+        </Button>
+      ),
+    },
+  ];
+
+  const propertyColumns = [
+    { header: 'Property', cell: (info) => info.row.original.name },
+    {
+      header: 'Occupancy',
+      cell: (info) => `${info.row.original.occupied}/${info.row.original.units} occupied`,
+    },
+    { header: 'Avg rent', cell: (info) => currency.format(info.row.original.avgRent) },
+    { header: 'Landlord', cell: (info) => info.row.original.landlord },
+    { header: 'Phone', cell: (info) => info.row.original.landlordPhone },
+  ];
+
+  const advanceTicket = (ticketId) => {
+    setTickets((prev) =>
+      prev.map((ticket) => {
+        if (ticket.id !== ticketId) return ticket;
+        const nextStatus = ticket.status === 'Open' ? 'In progress' : 'Closed';
+        return { ...ticket, status: nextStatus };
+      })
+    );
+  };
+
+  const handleReminderSend = (reminderId) => {
+    setReminders((prev) => prev.map((reminder) => (reminder.id === reminderId ? { ...reminder, status: 'Sent' } : reminder)));
+  };
+
+  const queueReminder = (tenantId) => {
+    const tenant = tenantLookup[tenantId];
+    if (!tenant) return;
+    setReminders((prev) => [
+      {
+        id: `rem-${prev.length + 10}`,
+        tenantId,
+        type: 'Late payment notice',
+        dueDate: new Date().toISOString().slice(0, 10),
+        channel: 'Email & SMS',
+        status: 'Queued',
+      },
+      ...prev,
+    ]);
+  };
 
   const handlePaymentSubmit = (event) => {
     event.preventDefault();
@@ -505,6 +615,88 @@ export default function HomePage() {
                 <span className="mt-1 h-2.5 w-2.5 rounded-full bg-indigo-500" />
                 Tenants can submit maintenance requests, pay rent, and receive receipts and reminders.
               </li>
+            </ul>
+          </Card>
+        </div>
+      </section>
+
+      <section className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
+        <div className="space-y-6">
+          <Card>
+            <CardHeader className="flex items-center justify-between">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  <MapPin className="text-brand-700" size={18} /> Portfolio snapshot
+                </CardTitle>
+                <CardDescription>Occupancy, landlord contacts, and average rents per property.</CardDescription>
+              </div>
+              <Badge intent="info">3 sites</Badge>
+            </CardHeader>
+            <SimpleTable columns={propertyColumns} data={properties} />
+          </Card>
+
+          <Card>
+            <CardHeader className="flex items-center justify-between">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  <AlertTriangle className="text-amber-600" size={18} /> Arrears & follow-ups
+                </CardTitle>
+                <CardDescription>Tenants below expected rent for this month.</CardDescription>
+              </div>
+              <Badge intent="warning">Collections</Badge>
+            </CardHeader>
+            <SimpleTable columns={arrearsColumns} data={arrears} />
+          </Card>
+        </div>
+
+        <div className="space-y-6">
+          <Card>
+            <CardHeader>
+              <CardTitle>Lease renewals & increases</CardTitle>
+              <CardDescription>Prepare rent uplifts 90–120 days before expiry.</CardDescription>
+            </CardHeader>
+            <ul className="space-y-4 px-4 pb-5 text-sm text-slate-700">
+              {renewals.map((tenant) => {
+                const daysToEnd = Math.round((new Date(tenant.leaseEnd) - new Date()) / (1000 * 60 * 60 * 24));
+                const suggestedIncrease = Math.round(tenant.rent * 1.08);
+                return (
+                  <li key={tenant.id} className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50/60 px-4 py-3">
+                    <div>
+                      <p className="font-semibold text-slate-900">{tenant.name}</p>
+                      <p className="text-xs text-slate-500">
+                        {propertyLookup[tenant.propertyId]?.name} · Unit {tenant.unit}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Due in {daysToEnd} days</p>
+                      <p className="text-sm font-semibold text-slate-900">Suggest ZMW {suggestedIncrease.toLocaleString()}</p>
+                    </div>
+                  </li>
+                );
+              })}
+              {renewals.length === 0 && (
+                <li className="rounded-lg border border-dashed border-slate-200 px-4 py-3 text-center text-slate-500">
+                  No renewals in the next 5 months.
+                </li>
+              )}
+            </ul>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Maintenance playbook</CardTitle>
+              <CardDescription>Coach the team on how to respond by priority.</CardDescription>
+            </CardHeader>
+            <ul className="space-y-3 px-4 pb-5 text-sm text-slate-700">
+              {maintenanceGuides.map((guide) => (
+                <li key={guide.title} className="flex items-start gap-3 rounded-lg bg-slate-50/80 px-4 py-3">
+                  <Wrench size={16} className="mt-1 text-rose-600" />
+                  <div>
+                    <p className="font-semibold text-slate-900">{guide.title}</p>
+                    <p className="text-slate-600">{guide.detail}</p>
+                  </div>
+                </li>
+              ))}
             </ul>
           </Card>
         </div>

@@ -11,6 +11,7 @@ const buttonVariants = cva(
         outline: 'border border-slate-200 bg-white text-slate-800 hover:border-brand-300 focus-visible:ring-brand-200',
       },
       size: {
+        xs: 'px-2 py-1 text-xs',
         sm: 'px-3 py-2',
         md: 'px-4 py-2.5',
         lg: 'px-5 py-3',
